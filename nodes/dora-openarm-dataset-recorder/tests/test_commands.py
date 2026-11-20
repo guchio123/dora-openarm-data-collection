@@ -18,7 +18,6 @@ import time
 
 import pyarrow as pa
 import pytest
-import yaml
 
 import dora_openarm_dataset_recorder.main as recorder
 
@@ -52,7 +51,7 @@ def command(name, **metadata):
 
 
 @pytest.fixture
-def run_node(monkeypatch, tmp_path):
+def run_node(monkeypatch, tmp_path, keep_raw_episodes):
     monkeypatch.delenv("METADATA_FILE", raising=False)
 
     def run(node):
@@ -71,8 +70,7 @@ def run_node(monkeypatch, tmp_path):
         )
         monkeypatch.setattr(recorder.dora, "Node", lambda: node)
         recorder.main()
-        with open(tmp_path / "dataset" / "metadata.yaml", encoding="utf-8") as f:
-            return yaml.safe_load(f)["episodes"]
+        return keep_raw_episodes.last.episodes
 
     return run
 

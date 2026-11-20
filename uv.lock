@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = "==3.12.*"
 
 [[package]]
@@ -379,15 +379,21 @@ name = "dora-openarm-dataset-recorder"
 version = "0.5.2"
 source = { editable = "nodes/dora-openarm-dataset-recorder" }
 dependencies = [
+    { name = "av" },
     { name = "dora-rs" },
     { name = "numpy" },
+    { name = "opencv-python-headless" },
+    { name = "pyarrow" },
     { name = "pyyaml" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "av", specifier = ">=14.0.0" },
     { name = "dora-rs", specifier = ">=0.5.0" },
     { name = "numpy" },
+    { name = "opencv-python-headless" },
+    { name = "pyarrow" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 

@@ -47,6 +47,14 @@ def test_clutch_words_tell_late_from_regrip():
     assert lines(hud.message(1.0))[1] == "L:HOLD  R:FOLLOW"
 
 
+def test_clutch_words_for_the_intro():
+    hud = Hud()
+    hud.on_clutch_state(json.dumps({"right": "released", "left": "setup"}))
+    assert lines(hud.message(0.0))[1] == "L:SETUP  R:HOLD"
+    hud.on_clutch_state(json.dumps({"right": "released", "left": "waiting"}))
+    assert lines(hud.message(1.0))[1] == "L:PRESS X  R:HOLD"
+
+
 def test_gate_line_only_names_arms_that_are_not_engaged():
     hud = Hud()
     hud.on_gate_state(

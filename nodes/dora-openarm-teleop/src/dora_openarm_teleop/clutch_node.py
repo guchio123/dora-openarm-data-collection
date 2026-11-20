@@ -7,7 +7,13 @@ Inputs:
   state_right/left  – STATE8 measured joints (optional): the first, and the first of
                       each new follower start_epoch, re-seed that arm's hold there
   reset_position    – QPOS16 from the sim after a reset (absent on the real robot)
-  control           – STRING ui/command: "quit" stops the node, "reset" holds home
+  control           – STRING ui/command: "quit" stops the node, "reset" holds home,
+                      "proceed" (the UI's Enter) moves an intro on that waits for it,
+                      and "success", "fail" or "cancel" (an episode ended) send
+                      both arms back to their start poses and run the intro again
+                      (--intro-every-episode)
+  button_x          – BOOL webxr's left X button (optional): a press does what
+                      "proceed" does
 
 Outputs:
   target_right/left – POSE8 on every tick for both arms, so the bimanual IK
@@ -34,6 +40,7 @@ import pyarrow as pa
 from dora_openarm_teleop import arrow
 from dora_openarm_teleop.clutch import Clutch, ClutchParams, ClutchTick, table_lift
 from dora_openarm_teleop.gate import SIM_ROBOTS
+from dora_openarm_teleop.intro import IntroParams
 from dora_openarm_teleop.model_info import SCENES
 
 Send = Callable[[str, pa.Array, dict[str, Any]], None]
@@ -140,7 +147,9 @@ def _handle_input(
             side = STATE_INPUTS[input_id]
             epoch = arrow.start_epoch(event.get("metadata"))
             seeded = clutch.on_robot_state(side, arrow.values(value, "qpos"), epoch)
-            if seeded:
+            if seeded and clutch.intro_running(side):
+                log(f"{input_id} (start_epoch {epoch}): starting the {side} arm's intro")
+            elif seeded:
                 log(f"{input_id} (start_epoch {epoch}): holding the arm's measured pose, locked")
             return seeded is not None
         if input_id == "reset_position":
@@ -153,6 +162,17 @@ def _handle_input(
     return True
 
 
+# ui/command values that end an episode: the intro runs again after each.
+EPISODE_END_COMMANDS = frozenset({"success", "fail", "cancel"})
+
+
+def _proceed(clutch: Clutch, log: Log, source: str) -> None:
+    if clutch.proceed():
+        log(f"{source}: closing the gripper, then the intro's flip")
+    else:
+        log(f"{source} ignored: no intro is waiting for it")
+
+
 def run(
     events: Iterable[Mapping[str, Any] | None],
     send: Send,
@@ -161,10 +181,13 @@ def run(
     clock: Callable[[], float] = time.monotonic,
     monitor: TickMonitor | None = None,
     log: Log = _log,
+    intro_every_episode: bool = False,
 ) -> str:
     """Process events until told to stop. Returns why it stopped."""
     closed: set[str] = set()
     malformed = _RateLimitedLog(log)
+    # webxr sends every button on every frame: a press is a False -> True edge.
+    x_down = False
     for event in events:
         if event is None:
             return "event stream ended"
@@ -200,6 +223,29 @@ def run(
             if command == "reset":
                 clutch.reset()
                 log("control=reset: holding home, arms locked")
+            elif command == "proceed":
+                _proceed(clutch, log, "control=proceed")
+            elif command in EPISODE_END_COMMANDS and intro_every_episode:
+                sides = clutch.restart_intro()
+                if sides:
+                    note = (
+                        f", the {clutch.intro} arm then runs its intro"
+                        if clutch.intro in sides
+                        else ""
+                    )
+                    log(
+                        f"control={command}: {' and '.join(sides)} going back to the start pose{note}"
+                    )
+            continue
+        if input_id == "button_x":
+            try:
+                pressed = bool(event["value"][0].as_py())
+            except (IndexError, KeyError, TypeError, AttributeError, pa.ArrowException):
+                malformed.warn(now, "button_x")
+                continue
+            if pressed and not x_down:
+                _proceed(clutch, log, "button X")
+            x_down = pressed
             continue
         if not _handle_input(event, now, clutch, send, log):
             malformed.warn(now, str(input_id))
@@ -313,6 +359,53 @@ def build_parser() -> argparse.ArgumentParser:
         default=200.0,
         help="expected tick rate; a warning is logged when the measured rate is >10%% off (0: off)",
     )
+    # Defaults from the environment, so that a module sets them with `env:` and
+    # scripts/check-dataflow, which parses these args under the node's env,
+    # rejects a bad value before the robot starts.
+    intro_defaults = IntroParams()
+    parser.add_argument(
+        "--intro",
+        type=_intro_side,
+        default=os.environ.get("INTRO_ARM", "none"),
+        help="the arm that runs the opening sequence after each Start Arm (docs/teleop.md, "
+        "Intro): right, left or none (default: $INTRO_ARM, else none)",
+    )
+    parser.add_argument(
+        "--intro-every-episode",
+        type=_on_off,
+        default=os.environ.get("INTRO_EVERY_EPISODE", "on"),
+        help="on: after each episode (success, fail or cancel) both arms go back to their "
+        "start poses and the intro arm runs the intro again; off: only after Start Arm "
+        "(default: $INTRO_EVERY_EPISODE, else on)",
+    )
+    parser.add_argument(
+        "--intro-open",
+        type=float,
+        default=intro_defaults.open_fraction,
+        help="fraction of its range the intro opens the gripper to",
+    )
+    parser.add_argument(
+        "--intro-turn-speed",
+        type=float,
+        default=intro_defaults.turn_speed,
+        help="rad/s: the intro's average roll speed",
+    )
+    parser.add_argument(
+        "--fixed-grippers",
+        type=_fixed_grippers,
+        default=os.environ.get("FIXED_GRIPPERS", "none"),
+        help="grippers held at a fixed opening whatever the trigger does, as SIDE=FRACTION "
+        "of the range open (0: closed), comma-separated, e.g. right=0.3, or none "
+        "(default: $FIXED_GRIPPERS, else none)",
+    )
+    parser.add_argument(
+        "--finger-down",
+        type=_sides,
+        default=os.environ.get("FINGER_DOWN", "none"),
+        help="comma-separated sides whose finger normally on the right is kept lowest, "
+        "the target's roll replacing the hand's: right, left, right,left or none "
+        "(default: $FINGER_DOWN, else none)",
+    )
     return parser
 
 
@@ -321,6 +414,59 @@ def _finite_float(text: str) -> float:
     if not math.isfinite(value):
         raise argparse.ArgumentTypeError(f"must be a finite number, got {text!r}")
     return value
+
+
+def _on_off(text: str) -> bool:
+    value = text.strip().lower()
+    if value in ("on", "1", "true", "yes"):
+        return True
+    if value in ("off", "0", "false", "no", ""):
+        return False
+    raise argparse.ArgumentTypeError(f"must be on or off, got {text!r}")
+
+
+def _intro_side(text: str) -> str | None:
+    side = text.strip().lower()
+    if side in ("", "none"):
+        return None
+    if side not in ("right", "left"):
+        raise argparse.ArgumentTypeError(f"must be right, left or none, got {text!r}")
+    return side
+
+
+def _sides(text: str) -> tuple[str, ...]:
+    sides: list[str] = []
+    for part in text.split(","):
+        side = part.strip().lower()
+        if side in ("", "none"):
+            continue
+        if side not in ("right", "left"):
+            raise argparse.ArgumentTypeError(
+                f"must be right, left, right,left or none, got {text!r}"
+            )
+        if side not in sides:
+            sides.append(side)
+    return tuple(sides)
+
+
+def _fixed_grippers(text: str) -> tuple[tuple[str, float], ...]:
+    fixed: dict[str, float] = {}
+    for part in text.split(","):
+        item = part.strip().lower()
+        if item in ("", "none"):
+            continue
+        side, _, fraction = item.partition("=")
+        side = side.strip()
+        try:
+            value = float(fraction)
+        except ValueError:
+            value = math.nan
+        if side not in ("right", "left") or side in fixed or not 0.0 <= value <= 1.0:
+            raise argparse.ArgumentTypeError(
+                f"must be SIDE=FRACTION items (right or left, 0 to 1), or none, got {text!r}"
+            )
+        fixed[side] = value
+    return tuple(fixed.items())
 
 
 def params_from_args(args: argparse.Namespace) -> ClutchParams:
@@ -342,7 +488,13 @@ def params_from_args(args: argparse.Namespace) -> ClutchParams:
         resume_gap_s=args.resume_gap_ms / 1000.0,
         resume_max_move=args.resume_max_move,
         resume_max_turn=args.resume_max_turn,
+        fixed_grippers=args.fixed_grippers,
+        finger_down=args.finger_down,
     )
+
+
+def intro_params_from_args(args: argparse.Namespace) -> IntroParams:
+    return IntroParams(open_fraction=args.intro_open, turn_speed=args.intro_turn_speed)
 
 
 def startup_warnings(clutch: Clutch, table_z: float | None) -> list[str]:
@@ -394,8 +546,11 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     robot_lines = apply_robot(args, os.environ)
     params = params_from_args(args)
+    intro_params = intro_params_from_args(args)
     # Load the model before joining the dataflow so the first ticks are served.
-    clutch = Clutch.from_scene(args.scene, params, args.tip_model, args.table_z)
+    clutch = Clutch.from_scene(
+        args.scene, params, args.tip_model, args.table_z, args.intro, intro_params
+    )
     table_z = clutch.arms["right"].model.table_z
     _log(
         f"scene={args.scene} scale={params.scale} grip {params.release_grip}/{params.engage_grip} "
@@ -407,7 +562,12 @@ def main(argv: list[str] | None = None) -> None:
         f"table={params.clamp_table}(z={table_z:.3f} m "
         f"{'from --table-z' if args.table_z is not None else f'from scene {args.scene}'}) "
         f"reach={params.clamp_reach}({params.reach_max} m) midline={params.clamp_midline} "
-        f"tip={args.tip_model} gripper_pickup={params.gripper_pickup} rad"
+        f"tip={args.tip_model} gripper_pickup={params.gripper_pickup} rad "
+        f"intro={args.intro or 'none'}(open {intro_params.open_fraction:g}, "
+        f"{intro_params.turn_speed:g} rad/s, "
+        f"{'every episode' if args.intro_every_episode else 'after Start Arm'}) "
+        f"fixed_grippers={','.join(f'{s}={v:g}' for s, v in params.fixed_grippers) or 'none'} "
+        f"finger_down={','.join(params.finger_down) or 'none'}"
     )
     for line in robot_lines:
         _log(line)
@@ -417,7 +577,13 @@ def main(argv: list[str] | None = None) -> None:
     import dora
 
     node = dora.Node()
-    reason = run(node, node.send_output, clutch, monitor=TickMonitor(args.tick_hz))
+    reason = run(
+        node,
+        node.send_output,
+        clutch,
+        monitor=TickMonitor(args.tick_hz),
+        intro_every_episode=args.intro_every_episode,
+    )
     _log(f"exiting: {reason}")
 
 

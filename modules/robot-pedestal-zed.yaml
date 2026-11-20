@@ -48,8 +48,23 @@ module:
 
 nodes:
   - id: right
-    path: ../dora-openarm
-    args: "--side right --align-trigger gripper --config openarm_pedestal"
+    path: ../dora-openarm-impedance
+    # dora-openarm with gravity compensation and soft joint gains, so the arm
+    # holds its own weight and yields when it touches something
+    # (docs/teleop.md, Impedance). IMPEDANCE=off runs plain dora-openarm.
+    env:
+      IMPEDANCE: "${IMPEDANCE:-on}"
+      # kp for joints 1-7, e.g. "30,30,20,20,5,5,5"; empty: 20,20,12,12,10,10,10.
+      IMPEDANCE_KP: "${IMPEDANCE_KP:-}"
+      GRAVITY_SCALE: "${GRAVITY_SCALE:-1.0}"
+      # Fraction of the commands' joint velocity sent as dq; 0 brakes every motion.
+      IMPEDANCE_VELOCITY_FF: "${IMPEDANCE_VELOCITY_FF:-1.0}"
+      # Nm per joint 1-7 added along the motion while a joint trails; empty:
+      # 0.52,0.34,0.38,0.69,0.07,0.13,0.11, all zeros for none.
+      IMPEDANCE_FRICTION: "${IMPEDANCE_FRICTION:-}"
+      # Seconds between log lines on how late commands arrive; 0 for none.
+      LATENCY_LOG_S: "${LATENCY_LOG_S:-10}"
+    args: "-- --side right --align-trigger gripper --config configs/openarm_pedestal_teleop.yaml"
     inputs:
       # Event ID is only used. Event value isn't used.
       # The quittable tick, not the position: the gate sends nothing until it
@@ -62,8 +77,17 @@ nodes:
       - status
 
   - id: left
-    path: ../dora-openarm
-    args: "--side left --align-trigger gripper --config openarm_pedestal"
+    path: ../dora-openarm-impedance
+    # As the right arm.
+    env:
+      IMPEDANCE: "${IMPEDANCE:-on}"
+      IMPEDANCE_KP: "${IMPEDANCE_KP:-}"
+      GRAVITY_SCALE: "${GRAVITY_SCALE:-1.0}"
+      IMPEDANCE_VELOCITY_FF: "${IMPEDANCE_VELOCITY_FF:-1.0}"
+      IMPEDANCE_FRICTION: "${IMPEDANCE_FRICTION:-}"
+      LATENCY_LOG_S: "${LATENCY_LOG_S:-10}"
+    # openarm_pedestal with about an eighth of the grip force; see the file.
+    args: "-- --side left --align-trigger gripper --config configs/openarm_pedestal_soft_gripper.yaml"
     inputs:
       request_state: _mod/tick
       move_position: _mod/position_left
@@ -120,39 +144,37 @@ nodes:
       - depth
       - depth_preview
 
-  # Wrist cameras are disabled: they aren't connected yet. To enable them,
-  # uncomment these two nodes, set CAPTURE_PATH, and move camera_wrist_*
-  # back above "Not sent" with their inputs in `cameras`.
-  # # USB cameras on the wrists, the same as robot-cell.yaml's.
-  # - id: wrist-right
-  #   path: ../opencv-video-capture
-  #   env:
-  #     # Please configure! A stable name for the device, such as a udev
-  #     # symlink or /dev/v4l/by-id/...-video-index0; /dev/videoN can swap
-  #     # between the two wrists across reboots.
-  #     CAPTURE_PATH: "/dev/camera_wrist_right"
-  #     ENCODING: "jpeg"
-  #     IMAGE_HEIGHT: 600
-  #     IMAGE_WIDTH: 960
-  #     JPEG_QUALITY: 90
-  #   inputs:
-  #     tick: _mod/camera_tick
-  #   outputs:
-  #     - image
+  # USB cameras on the wrists, Arducam B0495 (USB3 2.3MP) behind a powered
+  # hub on the front Type-C port. Both report the same serial number, so
+  # /dev/v4l/by-id/ has one link for the two of them; they are told apart by
+  # the hub port they are plugged into. Moving a camera to another port, or
+  # the hub to another PC port, changes these paths.
+  - id: wrist-right
+    path: ../opencv-video-capture
+    env:
+      CAPTURE_PATH: "/dev/v4l/by-path/pci-0000:00:14.0-usbv3-0:1.2:1.0-video-index0"
+      ENCODING: "jpeg"
+      IMAGE_HEIGHT: 600
+      IMAGE_WIDTH: 960
+      JPEG_QUALITY: 90
+    inputs:
+      tick: _mod/camera_tick
+    outputs:
+      - image
 
-  # - id: wrist-left
-  #   path: ../opencv-video-capture
-  #   env:
-  #     # Please configure! See wrist-right.
-  #     CAPTURE_PATH: "/dev/camera_wrist_left"
-  #     ENCODING: "jpeg"
-  #     IMAGE_HEIGHT: 600
-  #     IMAGE_WIDTH: 960
-  #     JPEG_QUALITY: 90
-  #   inputs:
-  #     tick: _mod/camera_tick
-  #   outputs:
-  #     - image
+  - id: wrist-left
+    path: ../opencv-video-capture
+    env:
+      # See wrist-right.
+      CAPTURE_PATH: "/dev/v4l/by-path/pci-0000:00:14.0-usbv3-0:1.1:1.0-video-index0"
+      ENCODING: "jpeg"
+      IMAGE_HEIGHT: 600
+      IMAGE_WIDTH: 960
+      JPEG_QUALITY: 90
+    inputs:
+      tick: _mod/camera_tick
+    outputs:
+      - image
 
   # Renames the cameras' outputs to the common names. Stops on Quit with the
   # cameras because `camera_tick` is closed, which also closes the outputs
@@ -160,17 +182,18 @@ nodes:
   - id: cameras
     path: ../dora-echo
     inputs:
+      camera_wrist_right: wrist-right/image
+      camera_wrist_left: wrist-left/image
       camera_head_left: head-zed/image_left
       camera_head_right: head-zed/image_right
       camera_head_depth: head-zed/depth
       camera_head_depth_preview: head-zed/depth_preview
     outputs:
+      - camera_wrist_right
+      - camera_wrist_left
       - camera_head_left
       - camera_head_right
       - camera_head_depth
       - camera_head_depth_preview
       # Not sent by the pedestal.
       - camera_ceiling
-      # Not sent while the wrist cameras are disabled.
-      - camera_wrist_right
-      - camera_wrist_left

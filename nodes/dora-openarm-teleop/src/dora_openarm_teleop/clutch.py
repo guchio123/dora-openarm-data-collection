@@ -42,6 +42,7 @@ from typing import Any
 import numpy as np
 
 from dora_openarm_teleop import frames
+from dora_openarm_teleop.intro import SETUP, Intro, IntroParams, Return, ease, finger_down
 
 ENGAGED = "engaged"
 RELEASED = "released"
@@ -104,8 +105,36 @@ class ClutchParams:
     # rad: the gripper target stays at the held angle until the hand's gripper
     # is this close to it (or crosses it).
     gripper_pickup: float = 0.05
+    # (side, fraction of the gripper's range open) for grippers held at a fixed
+    # opening whatever the hand's trigger does; 0 is closed.
+    fixed_grippers: tuple[tuple[str, float], ...] = ()
+    # Sides whose finger normally on the right is kept lowest: the target's roll
+    # about its approach axis is set, the hand's ignored (intro.finger_down).
+    finger_down: tuple[str, ...] = ()
+    # rad/s, the average speed of the finger-down turn after each start; it eases
+    # in and out like the intro's rolls.
+    turn_speed: float = 0.5
+    # rad: a measured gripper this close to closed counts as closed.
+    closed_tol: float = 0.15
+    # s: a side that moves on its own (fixed gripper, finger down) is commanded
+    # a closed gripper at least this long after each follower start before it
+    # moves (see ClutchArm._update_alignment).
+    fixed_close_s: float = 0.3
 
     def __post_init__(self) -> None:
+        sides = [side for side, _ in self.fixed_grippers]
+        if not set(sides) <= {"right", "left"} or len(set(sides)) != len(sides):
+            raise ValueError("fixed_grippers may name 'right' and 'left' once each")
+        if not set(self.finger_down) <= {"right", "left"}:
+            raise ValueError("finger_down may only name 'right' and 'left'")
+        if not (math.isfinite(self.turn_speed) and self.turn_speed > 0.0):
+            raise ValueError("turn_speed must be positive")
+        if not all(0.0 <= fraction <= 1.0 for _, fraction in self.fixed_grippers):
+            raise ValueError("fixed_grippers fractions must be in [0, 1]")
+        if not (math.isfinite(self.closed_tol) and self.closed_tol > 0.0):
+            raise ValueError("closed_tol must be positive")
+        if not (math.isfinite(self.fixed_close_s) and self.fixed_close_s >= 0.0):
+            raise ValueError("fixed_close_s must be a finite, non-negative number")
         if not 0.0 <= self.release_grip < self.engage_grip <= 1.0:
             raise ValueError("need 0 <= release_grip < engage_grip <= 1 (hysteresis)")
         if self.fresh_s <= 0.0:
@@ -300,7 +329,30 @@ class ClutchArm:
     def __init__(self, model: ArmModel, params: ClutchParams) -> None:
         self.model = model
         self.params = params
+        low, high = model.gripper_range
+        # 0 is closed (model_info.gripper_ranges); the far end of the range is open.
+        self._closed_angle = min(max(0.0, low), high)
+        fraction = dict(params.fixed_grippers).get(model.side)
+        far = high if abs(high) >= abs(low) else low
+        # The angle this side's gripper is held at, None when it follows the hand.
+        self._fixed_open = (
+            None if fraction is None else self._closed_angle + fraction * (far - self._closed_angle)
+        )
+        self._finger_down = model.side in params.finger_down
+        # dora-openarm (--align-trigger gripper) takes no command until it has been
+        # sent a closed gripper, and a target that moves before then can leave it
+        # unaligned for good. So a side that moves on its own (a fixed gripper
+        # opening, the finger-down turn) is first commanded a closed gripper after
+        # each follower start, until the arm measures it closed.
+        self._needs_alignment = self._fixed_open is not None or self._finger_down
+        self._aligned = False
+        self._closed_since: float | None = None
+        self._measured_gripper: float | None = None
         self._hold = np.concatenate([model.home, [0.0]]).astype(np.float64)
+        # The finger-down turn after a start or a reset: the orientation it eases
+        # from (None: no turn pending) and when it began (None: not yet).
+        self._turn_from: np.ndarray | None = self._hold[3:7].copy() if self._finger_down else None
+        self._turn_since: float | None = None
         self._pose: np.ndarray | None = None
         self._pose_t: float | None = None
         self._grip: float | None = None
@@ -382,7 +434,13 @@ class ClutchArm:
         pose = self.model.home if pose7 is None else np.asarray(pose7, dtype=np.float64)
         low, high = self.model.gripper_range
         self._hold = np.concatenate([pose[:3], frames.quat_normalize(pose[3:7]), [0.0]])
+        own = self._gripper_target()
+        if own is not None:
+            gripper = own
         self._hold[7] = min(max(float(gripper), low), high)
+        if self._finger_down:
+            # Turned in from here, slowly, rather than snapped to on the next tick.
+            self._turn_from, self._turn_since = self._hold[3:7].copy(), None
         self._clear_suspension()
         self._disarm()
         self._note = ""
@@ -391,6 +449,12 @@ class ClutchArm:
 
     def step(self, now: float) -> np.ndarray:
         """Advance the state machine at ``now`` and return the target (POSE8 float64)."""
+        own = self._gripper_target(now)
+        if own is not None:
+            self._hold[7] = own
+        if self._turn_from is not None:
+            # Before the hand: the turn runs whether a headset is there or not.
+            return self._turn(now)
         if not self._fresh(now):
             self._lose_input()
             self._state, self._detail = STALE, self._late_detail(now)
@@ -428,7 +492,10 @@ class ClutchArm:
 
         if self._engaged:
             self._pick_up_gripper()
-            self._hold = clamp_target(self._follow(), self.model, self.params)
+            target = self._follow()
+            if self._finger_down:
+                target[3:7] = finger_down(target[3:7])
+            self._hold = clamp_target(target, self.model, self.params)
         self._state = ENGAGED if self._engaged else RELEASED
         self._detail, self._note = self._note, ""
         return self._hold.copy()
@@ -441,8 +508,74 @@ class ClutchArm:
         target[:3] = held[:3] + self.params.scale * (self._pose[:3] - p0)
         delta = frames.quat_delta(q0, self._pose[3:7])
         target[3:7] = frames.quat_normalize(frames.quat_multiply(delta, held[3:7]))
-        target[7] = self._hand_gripper() if self._gripper_following else held[7]
+        own = self._gripper_target()
+        if own is not None:
+            # Not picked up: it moves (closed, then open) while the anchor's stays.
+            target[7] = own
+        else:
+            target[7] = self._hand_gripper() if self._gripper_following else held[7]
         return target
+
+    def on_measured_gripper(self, value: float) -> None:
+        """The arm's latest measured gripper angle, which the alignment waits on."""
+        self._measured_gripper = float(value)
+
+    def follower_restarted(self) -> None:
+        """A new follower start: wait for the arm to align again (see _update_alignment)."""
+        self._aligned = False
+        self._closed_since = None
+
+    def _update_alignment(self, now: float) -> None:
+        """Note when the follower has aligned: a closed gripper, commanded for
+        fixed_close_s, that the arm measures closed shows it takes commands."""
+        if self._aligned:
+            return
+        if self._closed_since is None:
+            self._closed_since = now
+        measured = self._measured_gripper
+        if (
+            now - self._closed_since >= self.params.fixed_close_s
+            and measured is not None
+            and abs(measured - self._closed_angle) <= self.params.closed_tol
+        ):
+            self._aligned = True
+
+    def _gripper_target(self, now: float | None = None) -> float | None:
+        """The gripper this side holds on its own at ``now``; None when it follows the hand.
+
+        Closed until the follower has aligned, for a side that needs it; then a
+        fixed gripper's opening, or None.
+        """
+        if not self._needs_alignment:
+            return None
+        if now is not None:
+            self._update_alignment(now)
+        return self._fixed_open if self._aligned else self._closed_angle
+
+    def _turn(self, now: float) -> np.ndarray:
+        """The finger-down turn: hold still until the arm aligns, then ease the roll in.
+
+        The arm is not taken by the hand meanwhile (state ``setup``); after the
+        turn it is locked until the grip is released, as after any reset.
+        """
+        assert self._turn_from is not None
+        self._state = SETUP
+        if not self._aligned:
+            self._detail = "closing the gripper so that the arm aligns"
+            return self._hold.copy()
+        goal = finger_down(self._turn_from)
+        angle = float(frames.quat_angle(frames.quat_delta(self._turn_from, goal)))
+        if self._turn_since is None:
+            self._turn_since = now
+        t = (now - self._turn_since) * self.params.turn_speed / angle if angle > 1e-9 else 1.0
+        if t >= 1.0:
+            self._hold[3:7] = goal
+            self._turn_from = None
+            self._detail = "turned the finger on the right down"
+        else:
+            self._hold[3:7] = frames.quat_slerp(self._turn_from, goal, ease(t))
+            self._detail = "turning the finger on the right down"
+        return self._hold.copy()
 
     def _hand_gripper(self) -> float:
         assert self._pose is not None
@@ -614,7 +747,9 @@ class ClutchTick:
 
     targets: dict[str, np.ndarray]
     states: dict[str, str]
-    changed: bool  # states differ from the previous tick (always True on the first)
+    # States differ from the previous tick (always True on the first), or an
+    # intro moved on to its next step.
+    changed: bool
     # Why each arm is in its state ("grip 214 ms late", "release the grip",
     # "kept the grip across a 137 ms gap"); logged, never published: a state
     # change alone is the same line whether the pose stopped or the grip did.
@@ -632,8 +767,14 @@ class Clutch:
         models: Mapping[str, ArmModel],
         params: ClutchParams | None = None,
         fk: ForwardKinematics | None = None,
+        intro: str | None = None,
+        intro_params: IntroParams | None = None,
     ) -> None:
         params = params or ClutchParams()
+        if intro not in (None, "right", "left"):
+            raise ValueError(f"intro must be 'right', 'left' or None, got {intro!r}")
+        if intro is not None and intro in params.finger_down:
+            raise ValueError(f"the {intro} arm cannot run the intro and keep its finger down")
         self.params = params
         # Right before left, the order of every bimanual message.
         self.arms = {side: ClutchArm(models[side], params) for side in ("right", "left")}
@@ -641,6 +782,18 @@ class Clutch:
         self._last_states: dict[str, str] | None = None
         # The follower's start_epoch last seen per arm (None: a robot without one).
         self._robot_epochs: dict[str, int | None] = {}
+        # The side that runs the opening sequence after each follower start
+        # (docs/teleop.md, Intro), its parameters and the sequences under way.
+        self.intro = intro
+        self.intro_params = intro_params or IntroParams()
+        self._intros: dict[str, Intro | Return] = {}
+        # Where each arm held after its follower's last start (FK of the measured
+        # start pose): an intro run again after an episode goes back there.
+        self._start_poses: dict[str, np.ndarray] = {}
+        # What each arm in "setup" (intro or finger-down turn) said last tick.
+        self._last_setup_details: dict[str, str] = {}
+        # The latest measured gripper angle per arm, which the intro waits on.
+        self._measured_gripper: dict[str, float] = {}
 
     @classmethod
     def from_scene(
@@ -649,13 +802,17 @@ class Clutch:
         params: ClutchParams | None = None,
         tip_model: str = "hull",
         table_z: float | None = None,
+        intro: str | None = None,
+        intro_params: IntroParams | None = None,
     ) -> Clutch:
         from dora_openarm_teleop import model_info
 
         def fk(qpos16: np.ndarray) -> Mapping[str, np.ndarray]:
             return model_info.ee_poses_from_qpos(qpos16, scene)
 
-        return cls(arm_models_from_scene(scene, tip_model, table_z), params, fk)
+        return cls(
+            arm_models_from_scene(scene, tip_model, table_z), params, fk, intro, intro_params
+        )
 
     def on_pose(self, side: str, now: float, values: Any) -> bool:
         return self.arms[side].on_pose(now, values)
@@ -664,9 +821,47 @@ class Clutch:
         return self.arms[side].on_grip(now, value)
 
     def reset(self) -> None:
-        """control=reset: every arm holds home with the gripper closed, locked."""
+        """control=reset: every arm holds home with the gripper closed, locked.
+
+        An intro under way is dropped: the arm is no longer where it started.
+        """
+        self._intros.clear()
         for arm in self.arms.values():
             arm.reset()
+
+    def proceed(self) -> bool:
+        """control=proceed (the left controller's X, or the UI's Enter): an intro
+        waiting for it moves on.
+
+        Returns False when no intro was waiting.
+        """
+        return any(intro.proceed() for intro in self._intros.values())
+
+    def restart_intro(self) -> list[str]:
+        """An episode ended: every arm goes back to its start pose from wherever the
+        hand left it, and the intro side then runs its intro again.
+
+        Returns the sides that started back. An arm before its first start, or
+        still in its intro or on its way back, is left alone.
+        """
+        started = []
+        for side, arm in self.arms.items():
+            if side not in self._start_poses or side in self._intros:
+                continue
+            if side == self.intro:
+                self._intros[side] = Intro(
+                    self._start_poses[side],
+                    arm.model.gripper_range,
+                    self.intro_params,
+                    current=arm.hold,
+                )
+            else:
+                self._intros[side] = Return(self._start_poses[side], arm.hold, self.intro_params)
+            started.append(side)
+        return started
+
+    def intro_running(self, side: str) -> bool:
+        return side in self._intros
 
     def reset_position(self, qpos16: Any) -> bool:
         """reset_position (QPOS16): hold the FK pose of that configuration, locked.
@@ -684,6 +879,7 @@ class Clutch:
         if self._fk is None:
             raise RuntimeError("Clutch was built without forward kinematics")
         poses = self._fk(values)
+        self._intros.clear()
         for offset, side in ((0, "right"), (8, "left")):
             self.arms[side].reset(poses[side], values[offset + 7])
         return True
@@ -698,8 +894,10 @@ class Clutch:
         waits while the IK is more than jump_tol from the arm, engages on a robot whose
         start pose is not the scene's home (the Cell's J4 is 0.2 rad off it). Any other
         state is ignored: holding the measured pose all the time would let the hold
-        follow the arm's sag under gravity. Returns True when the arm was re-seeded,
-        False when the state was ignored, None for malformed input.
+        follow the arm's sag under gravity, except for the gripper angle, which an
+        intro waits on. The intro side starts its intro from the re-seeded hold.
+        Returns True when the arm was re-seeded, False when the state was ignored,
+        None for malformed input.
         """
         try:
             values = np.asarray(qpos, dtype=np.float64).reshape(-1)
@@ -707,6 +905,9 @@ class Clutch:
             return None
         if values.shape[0] < 8 or not np.all(np.isfinite(values[:8])):
             return None
+        arm = self.arms[side]
+        self._measured_gripper[side] = float(values[7])
+        arm.on_measured_gripper(values[7])
         if side in self._robot_epochs and (epoch is None or epoch == self._robot_epochs[side]):
             return False
         self._robot_epochs[side] = epoch
@@ -715,16 +916,43 @@ class Clutch:
         qpos16 = np.zeros(16)
         offset = 0 if side == "right" else 8
         qpos16[offset : offset + 8] = values[:8]
-        self.arms[side].reset(self._fk(qpos16)[side], values[7])
+        arm.follower_restarted()
+        arm.reset(self._fk(qpos16)[side], values[7])
+        self._start_poses[side] = arm.hold.copy()
+        if side == self.intro:
+            self._intros[side] = Intro(arm.hold, arm.model.gripper_range, self.intro_params)
         return True
 
     def tick(self, now: float) -> ClutchTick:
-        targets = {side: arm.step(now).astype(np.float32) for side, arm in self.arms.items()}
-        states = {side: arm.state for side, arm in self.arms.items()}
-        details = {side: arm.detail for side, arm in self.arms.items()}
-        changed = states != self._last_states
+        targets, states, details = {}, {}, {}
+        for side, arm in self.arms.items():
+            intro = self._intros.get(side)
+            if intro is not None:
+                # The hand is ignored while an intro runs; its target goes
+                # through the same clamps as a followed one.
+                target = intro.step(now, self._measured_gripper.get(side))
+                target = clamp_target(target, arm.model, self.params)
+                if not intro.done:
+                    targets[side] = target.astype(np.float32)
+                    states[side], details[side] = intro.state, intro.detail
+                    continue
+                # Done: the clutch holds where the intro ended, locked until
+                # the grip is released, and takes over from this tick on.
+                del self._intros[side]
+                arm.reset(target[:7], target[7])
+            targets[side] = arm.step(now).astype(np.float32)
+            states[side], details[side] = arm.state, arm.detail
+        # An intro or a finger-down turn stays "setup" through most of its steps;
+        # a new step is published (and logged) like a state change, so the log
+        # says where it is.
+        setup_details = {side: details[side] for side, state in states.items() if state == SETUP}
+        changed = states != self._last_states or setup_details != self._last_setup_details
         self._last_states = states
+        self._last_setup_details = setup_details
         return ClutchTick(targets, states, changed, details)
 
     def states(self) -> dict[str, str]:
-        return {side: arm.state for side, arm in self.arms.items()}
+        return {
+            side: intro.state if (intro := self._intros.get(side)) else arm.state
+            for side, arm in self.arms.items()
+        }

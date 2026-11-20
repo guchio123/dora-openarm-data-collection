@@ -23,6 +23,7 @@ from dora_openarm_teleop.clutch import (
     arm_models_from_scene,
     table_lift,
 )
+from dora_openarm_teleop.intro import Intro, IntroParams
 
 DT = 0.005  # 200 Hz tick
 NO_CLAMPS = ClutchParams(clamp_table=False, clamp_reach=False, clamp_midline=False)
@@ -1294,11 +1295,16 @@ def _slot(
     ]
 
 
-def _run(events, clutch: Clutch, clock: FakeClock):
+def _run(events, clutch: Clutch, clock: FakeClock, **options):
     sent: list[tuple[str, pa.Array, dict]] = []
     logs: list[str] = []
     reason = clutch_node.run(
-        events, lambda o, v, m: sent.append((o, v, m)), clutch, clock=clock, log=logs.append
+        events,
+        lambda o, v, m: sent.append((o, v, m)),
+        clutch,
+        clock=clock,
+        log=logs.append,
+        **options,
     )
     return reason, sent, logs
 
@@ -1542,3 +1548,385 @@ def test_malformed_robot_state_is_rejected(hull_models, bad) -> None:
     assert rig.clutch.on_robot_state("right", bad, 1) is None
     # ...and does not count as the first state.
     assert rig.clutch.on_robot_state("right", CELL_START, 1) is True
+
+
+# --- fixed grippers and the intro (docs/teleop.md, Intro) --------------------
+
+
+def _start_qpos(gripper: float) -> np.ndarray:
+    """One arm's 8 joints at dora-openarm's start pose (J4 at 90 deg)."""
+    qpos = np.zeros(8)
+    qpos[3] = math.pi / 2
+    qpos[7] = gripper
+    return qpos
+
+
+def test_a_fixed_gripper_closes_until_the_arm_aligns_then_holds_its_opening(
+    hull_models,
+) -> None:
+    """dora-openarm takes no command until it is sent a closed gripper (ALIGNED)."""
+    params = ClutchParams(
+        clamp_table=False, clamp_reach=False, clamp_midline=False, fixed_grippers=(("right", 0.3),)
+    )
+    rig = _rig(hull_models, params)
+    opening = 0.3 * hull_models["right"].gripper_range[0]  # the right one opens towards -
+    assert rig.clutch.on_robot_state("right", _start_qpos(-0.4), epoch=1)  # Start Arm
+    rig.step(2)
+    rig.grips["right"] = 1.0
+    rig.hands["right"][7] = -0.78  # the trigger relaxed all the way open
+    result = rig.step(100)  # 0.5 s, and the arm has not closed it: not aligned
+    assert result.states["right"] == ENGAGED
+    assert result.targets["right"][7] == 0.0
+
+    rig.clutch.on_robot_state("right", _start_qpos(-0.01), epoch=1)  # now it has
+    for gripper in (0.0, -0.4, -0.78):
+        rig.hands["right"][7] = gripper
+        result = rig.step(3)
+        assert result.states["right"] == ENGAGED
+        assert result.targets["right"][7] == pytest.approx(opening)
+    rig.grips["right"] = 0.0
+    assert rig.step(3).targets["right"][7] == pytest.approx(opening)  # released too
+
+    # Pause Arm, Start Arm: closed again until the arm has closed it.
+    assert rig.clutch.on_robot_state("right", _start_qpos(-0.4), epoch=2)
+    assert rig.step(100).targets["right"][7] == 0.0
+
+
+def test_a_fixed_gripper_opens_only_after_it_was_commanded_closed_for_a_while(
+    hull_models,
+) -> None:
+    """A gripper already closed at the start still gets a closed command to align on."""
+    params = ClutchParams(
+        clamp_table=False, clamp_reach=False, clamp_midline=False, fixed_grippers=(("right", 0.3),)
+    )
+    rig = _rig(hull_models, params)
+    assert rig.clutch.on_robot_state("right", _start_qpos(0.0), epoch=1)
+    ticks = round(params.fixed_close_s / DT)
+    closed = [rig.step().targets["right"][7] for _ in range(ticks + 2)]
+    assert closed[: ticks - 1] == [0.0] * (ticks - 1)
+    assert closed[-1] == pytest.approx(0.3 * hull_models["right"].gripper_range[0])
+
+
+@pytest.mark.parametrize(
+    "fixed", [(("middle", 0.3),), (("right", 1.5),), (("right", 0.3), ("right", 0.2))]
+)
+def test_fixed_grippers_are_validated(fixed) -> None:
+    with pytest.raises(ValueError):
+        ClutchParams(fixed_grippers=fixed)
+
+
+def test_the_intro_side_is_validated() -> None:
+    with pytest.raises(ValueError):
+        Clutch(arm_models_from_scene("cell", "point"), intro="middle")
+
+
+class _ArmEcho:
+    """The followers: each tick, the measured gripper is the commanded one."""
+
+    def __init__(self, rig: Rig) -> None:
+        self.rig = rig
+        self.left_states: list[str] = []
+
+    def step(self, n: int = 1):
+        result = None
+        for _ in range(n):
+            result = self.rig.step()
+            for side in ("right", "left"):
+                qpos = _start_qpos(float(result.targets[side][7]))
+                self.rig.clutch.on_robot_state(side, qpos, epoch=1)
+            self.left_states.append(result.states["left"])
+        return result
+
+    def until_left(self, state: str, limit_s: float = 30.0):
+        for _ in range(round(limit_s / DT)):
+            result = self.step()
+            if result.states["left"] == state:
+                return result
+        raise AssertionError(f"left never became {state}: {self.left_states[-1]}")
+
+
+def test_the_left_intro_runs_after_start_arm_then_the_clutch_takes_over(hull_models) -> None:
+    clutch = Clutch(hull_models, NO_CLAMPS, fk=model_info.ee_poses_from_qpos, intro="left")
+    rig = Rig(clutch)
+    # Squeezed all along: the intro ignores the hand, and the clutch only takes
+    # the arm once the grip has been released afterwards.
+    rig.grips["left"] = 1.0
+    assert clutch.on_robot_state("right", _start_qpos(-0.4), epoch=1)
+    assert clutch.on_robot_state("left", _start_qpos(0.4), epoch=1)
+    assert clutch.intro_running("left") and not clutch.intro_running("right")
+    arms = _ArmEcho(rig)
+
+    start = model_info.ee_poses_from_qpos(np.concatenate([_start_qpos(0), _start_qpos(0)]))
+    waiting = arms.until_left("waiting")
+    assert set(arms.left_states[:-1]) == {"setup"}
+    assert waiting.states["right"] == RELEASED  # the right arm teleoperates meanwhile
+    up = frames.quat_to_matrix(waiting.targets["left"][3:7].astype(float))[:, 1]
+    np.testing.assert_allclose(up, [0, 0, 1], atol=1e-6)  # site +y up: right finger down
+    assert waiting.targets["left"][7] == pytest.approx(0.3927, abs=1e-4)
+    np.testing.assert_allclose(waiting.targets["left"][:3], start["left"][:3], atol=1e-6)
+
+    assert clutch.proceed()
+    handed = arms.until_left(LOCKED)
+    assert not clutch.intro_running("left")
+    down = frames.quat_to_matrix(handed.targets["left"][3:7].astype(float))[:, 1]
+    np.testing.assert_allclose(down, [0, 0, -1], atol=1e-6)  # left finger down
+    assert handed.targets["left"][7] == 0.0
+    assert not clutch.proceed()  # nothing waits any more
+
+    # Release, squeeze again: it follows the hand from where the intro left it.
+    rig.grips["left"] = 0.0
+    assert arms.until_left(RELEASED).targets["left"][7] == 0.0
+    rig.grips["left"] = 1.0
+    arms.step(2)
+    moved = rig.move("left", (0.0, 0.0, 0.05))
+    assert moved.states["left"] == ENGAGED
+    np.testing.assert_allclose(
+        moved.targets["left"][:3], handed.targets["left"][:3] + [0, 0, 0.05], atol=1e-6
+    )
+    np.testing.assert_allclose(moved.targets["left"][3:7], handed.targets["left"][3:7], atol=1e-6)
+
+
+def test_each_start_arm_runs_the_intro_again_and_reset_drops_it(hull_models) -> None:
+    clutch = Clutch(hull_models, NO_CLAMPS, fk=model_info.ee_poses_from_qpos, intro="left")
+    rig = Rig(clutch)
+    clutch.on_robot_state("left", _start_qpos(0.4), epoch=1)
+    arms = _ArmEcho(rig)
+    arms.until_left("waiting")
+    clutch.reset()
+    assert not clutch.intro_running("left")
+    assert clutch.on_robot_state("left", _start_qpos(0.4), epoch=2)  # Pause, Start Arm
+    assert clutch.intro_running("left")
+    assert arms.step().states["left"] == "setup"
+
+
+def test_an_episode_end_sends_the_intro_arm_back_and_runs_it_again(hull_models) -> None:
+    clutch = Clutch(hull_models, NO_CLAMPS, fk=model_info.ee_poses_from_qpos, intro="left")
+    rig = Rig(clutch)
+    rig.grips["left"] = 1.0  # squeezed: the intro hands the arm over locked
+    assert clutch.restart_intro() == []  # before the arms' first start
+    clutch.on_robot_state("right", _start_qpos(-0.4), epoch=1)
+    clutch.on_robot_state("left", _start_qpos(0.4), epoch=1)
+    arms = _ArmEcho(rig)
+    first = arms.until_left("waiting")
+    start_right = first.targets["right"].astype(np.float64)
+    assert clutch.restart_intro() == ["right"]  # the left one is still in its intro
+    clutch._intros.pop("right")  # (undone: only the end of the test sends it back)
+    clutch.proceed()
+    arms.until_left(LOCKED)
+    # The hand takes the arm 10 cm up and away.
+    rig.grips["left"] = 0.0
+    arms.until_left(RELEASED)
+    rig.grips["left"] = 1.0
+    arms.step(2)
+    moved = rig.move("left", (0.05, 0.0, 0.10))
+    assert moved.states["left"] == ENGAGED
+
+    rig.grips["right"] = 1.0
+    arms.step(2)
+    right_moved = rig.move("right", (0.05, 0.0, 0.10))
+    assert right_moved.states["right"] == ENGAGED
+
+    assert clutch.restart_intro() == ["right", "left"]
+    back = arms.step()
+    assert back.states["left"] == "setup" and back.states["right"] == "setup"
+    np.testing.assert_allclose(
+        back.targets["right"][:3], right_moved.targets["right"][:3], atol=2e-3
+    )
+    # It leaves from where the hand left it, not from the start pose.
+    np.testing.assert_allclose(back.targets["left"][:3], moved.targets["left"][:3], atol=2e-3)
+    again = arms.until_left("waiting")
+    np.testing.assert_allclose(again.targets["left"], first.targets["left"], atol=1e-5)
+    # The right arm is back at its start pose, held there until the grip is released.
+    assert again.states["right"] == LOCKED
+    np.testing.assert_allclose(again.targets["right"][:7], start_right[:7], atol=1e-5)
+    assert clutch.proceed()
+    assert arms.until_left(LOCKED).targets["left"][7] == 0.0
+
+
+def test_intro_return_eases_back_at_the_return_speed() -> None:
+    start = np.array([0.2, 0.15, -0.2, 1.0, 0.0, 0.0, 0.0, 0.0])
+    current = start.copy()
+    current[:3] += [0.0, 0.0, 0.1]
+    intro = Intro(start, (0.0, 0.7854), IntroParams(return_speed=0.1), current=current)
+    assert intro.phase == "return"
+    np.testing.assert_allclose(intro.step(0.0, 0.0)[:3], current[:3])
+    np.testing.assert_allclose(intro.step(0.5, 0.0)[:3], start[:3] + [0, 0, 0.05], atol=1e-9)
+    intro.step(1.0, 0.0)  # 0.1 m at 0.1 m/s: back
+    assert intro.phase != "return"
+
+
+def test_node_restarts_the_intro_on_episode_end_and_x_proceeds(hull_models) -> None:
+    clock = FakeClock()
+    clutch = Clutch(hull_models, NO_CLAMPS, fk=model_info.ee_poses_from_qpos, intro="left")
+    state = arrow.state_array(_start_qpos(0.4), np.zeros(8), np.zeros(8))
+    x = {False: pa.array([False]), True: pa.array([True])}
+    clutch.on_robot_state("left", _start_qpos(0.4), epoch=1)
+    clutch._intros.clear()  # as if its first intro had finished
+    events = [
+        {"type": "INPUT", "id": "state_left", "value": state, "metadata": {"start_epoch": 1}},
+        _input("control", arrow.string_array("success")),
+        _input("button_x", x[True]),
+        _input("button_x", x[True]),  # held: one press
+        _input("button_x", x[False]),
+        *_script(clock, [[]]),
+    ]
+    _, _, logs = _run(events, clutch, clock, intro_every_episode=True)
+    assert (
+        "control=success: left going back to the start pose, the left arm then runs its intro"
+        in logs
+    )
+    assert logs.count("button X ignored: no intro is waiting for it") == 1
+    assert clutch.intro_running("left")
+
+    off = Clutch(hull_models, NO_CLAMPS, fk=model_info.ee_poses_from_qpos, intro="left")
+    off.on_robot_state("left", _start_qpos(0.4), epoch=1)
+    off._intros.clear()
+    _run([_input("control", arrow.string_array("fail"))], off, FakeClock())
+    assert not off.intro_running("left")
+
+
+def test_node_starts_the_intro_and_passes_enter_on(hull_models) -> None:
+    clock = FakeClock()
+    clutch = Clutch(hull_models, NO_CLAMPS, fk=model_info.ee_poses_from_qpos, intro="left")
+    state = arrow.state_array(_start_qpos(0.4), np.zeros(8), np.zeros(8))
+    events = [
+        {"type": "INPUT", "id": "state_left", "value": state, "metadata": {"start_epoch": 1}},
+        _input("control", arrow.string_array("proceed")),
+        *_script(clock, [[]]),
+    ]
+    _, sent, logs = _run(events, clutch, clock)
+
+    assert "state_left (start_epoch 1): starting the left arm's intro" in logs
+    assert "control=proceed ignored: no intro is waiting for it" in logs
+    states = [json.loads(arrow.text(s[1])) for s in sent if s[0] == "clutch_state"]
+    assert states[-1]["left"] == "setup"
+
+
+def test_node_args_read_the_intro_and_fixed_grippers_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("INTRO_ARM", "left")
+    monkeypatch.setenv("FIXED_GRIPPERS", "right=0.3, left=0")
+    args = clutch_node.build_parser().parse_args([])
+    assert args.intro == "left"
+    assert clutch_node.params_from_args(args).fixed_grippers == (("right", 0.3), ("left", 0.0))
+    args = clutch_node.build_parser().parse_args(["--intro", "none", "--fixed-grippers", "none"])
+    assert args.intro is None and args.fixed_grippers == ()
+    for name, bad in (
+        ("INTRO_ARM", "middle"),
+        ("FIXED_GRIPPERS", "right=2"),
+        ("FIXED_GRIPPERS", "right"),
+    ):
+        monkeypatch.setenv(name, bad)
+        with pytest.raises(SystemExit):
+            clutch_node.build_parser().parse_args([])
+        monkeypatch.delenv(name)
+
+
+def _finger_down_rig(hull_models, fixed=(("right", 0.6),)):
+    params = ClutchParams(
+        clamp_table=False,
+        clamp_reach=False,
+        clamp_midline=False,
+        fixed_grippers=fixed,
+        finger_down=("right",),
+    )
+    clutch = Clutch(hull_models, params, fk=model_info.ee_poses_from_qpos)
+    return Rig(clutch), params
+
+
+def _up(quat) -> float:
+    return float(frames.quat_to_matrix(np.asarray(quat, dtype=float))[:, 1] @ [0, 0, 1])
+
+
+def test_the_finger_down_turn_waits_for_the_arm_then_eases_in(hull_models) -> None:
+    rig, params = _finger_down_rig(hull_models)
+    clutch = rig.clutch
+    assert clutch.on_robot_state("right", _start_qpos(-0.4), epoch=1)  # Start Arm
+    start = clutch.arms["right"].hold
+    for _ in range(100):  # 0.5 s with the gripper not closing: the arm is not aligned
+        result = rig.step()
+    assert result.states["right"] == "setup"
+    assert result.targets["right"][7] == 0.0
+    np.testing.assert_allclose(result.targets["right"][3:7], start[3:7], atol=1e-6)
+
+    arms = _ArmEcho(rig)  # now the arm closes it: aligned, the turn starts
+    targets = []
+    for _ in range(round(5.0 / DT)):
+        result = arms.step()
+        targets.append(result.targets["right"].astype(float))
+        if result.states["right"] != "setup":
+            break
+    assert result.states["right"] in (LOCKED, RELEASED)
+    assert _up(result.targets["right"][3:7]) == pytest.approx(1.0, abs=1e-5)
+    turns = frames.quat_angle(
+        frames.quat_delta(np.array(targets[:-1])[:, 3:7], np.array(targets[1:])[:, 3:7])
+    )
+    assert float(np.max(turns)) <= 1.5 * params.turn_speed * DT * 1.05
+    opening = 0.6 * hull_models["right"].gripper_range[0]
+    assert result.targets["right"][7] == pytest.approx(opening)  # aligned: open to 60%
+
+
+def test_a_finger_down_arm_ignores_the_hands_roll_but_follows_its_tilt(hull_models) -> None:
+    rig, _ = _finger_down_rig(hull_models)
+    rig.clutch.on_robot_state("right", _start_qpos(-0.4), epoch=1)
+    arms = _ArmEcho(rig)
+    arms.until_left(RELEASED)  # the left arm is not constrained; just tick past the turn
+    while arms.step().states["right"] != RELEASED:
+        pass
+    held = rig.clutch.arms["right"].hold
+    rig.grips["right"] = 1.0
+    arms.step(2)
+
+    def turned(axis, degrees):
+        q = frames.quat_from_axis_angle(axis, math.radians(degrees))
+        rig.hands["right"][3:7] = frames.quat_multiply(q, [1.0, 0.0, 0.0, 0.0])
+        return arms.step(3).targets["right"].astype(float)
+
+    # A roll about the fingers (forward, +x) is dropped: nothing turns.
+    rolled = turned([1.0, 0.0, 0.0], 40)
+    assert rig.clutch.states()["right"] == ENGAGED
+    np.testing.assert_allclose(np.abs(rolled[3:7] @ held[3:7]), 1.0, atol=1e-6)
+    # Tilting the fingers down is followed, with the finger on the right kept lowest.
+    tilted = turned([0.0, 1.0, 0.0], 30)
+    approach = -frames.quat_to_matrix(tilted[3:7])[:, 2]
+    assert approach[2] == pytest.approx(-math.sin(math.radians(30)), abs=1e-5)
+    assert _up(tilted[3:7]) == pytest.approx(math.cos(math.radians(30)), abs=1e-5)
+
+
+def test_finger_down_is_validated(hull_models) -> None:
+    with pytest.raises(ValueError):
+        ClutchParams(finger_down=("middle",))
+    with pytest.raises(ValueError):
+        ClutchParams(turn_speed=0.0)
+    with pytest.raises(ValueError):
+        Clutch(hull_models, ClutchParams(finger_down=("left",)), intro="left")
+
+
+def test_node_args_read_finger_down_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("FINGER_DOWN", "right")
+    args = clutch_node.build_parser().parse_args([])
+    assert clutch_node.params_from_args(args).finger_down == ("right",)
+    monkeypatch.setenv("FINGER_DOWN", "up")
+    with pytest.raises(SystemExit):
+        clutch_node.build_parser().parse_args([])
+
+
+def test_a_closed_fixed_gripper_stays_closed_after_the_intro(hull_models) -> None:
+    """FIXED_GRIPPERS left=0: the intro opens it halfway and closes it, then nothing opens it."""
+    params = ClutchParams(
+        clamp_table=False, clamp_reach=False, clamp_midline=False, fixed_grippers=(("left", 0.0),)
+    )
+    clutch = Clutch(hull_models, params, fk=model_info.ee_poses_from_qpos, intro="left")
+    rig = Rig(clutch)
+    clutch.on_robot_state("left", _start_qpos(0.4), epoch=1)
+    arms = _ArmEcho(rig)
+    assert arms.until_left("waiting").targets["left"][7] == pytest.approx(0.3927, abs=1e-4)
+    clutch.proceed()
+    arms.until_left(RELEASED)
+    rig.grips["left"] = 1.0
+    arms.step(2)
+    # Pulled all the way (which would pick the gripper up) and then let go open.
+    for gripper in (0.0, 0.4, 0.78):
+        rig.hands["left"][7] = gripper
+        result = arms.step(5)
+        assert result.states["left"] == ENGAGED
+        assert result.targets["left"][7] == 0.0

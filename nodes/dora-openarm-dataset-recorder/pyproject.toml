@@ -22,8 +22,11 @@ readme = "README.md"
 requires-python = ">=3.8"
 
 dependencies = [
+  "av >= 14.0.0",
   "dora-rs >= 0.5.0",
   "numpy",
+  "opencv-python-headless",
+  "pyarrow",
   "pyyaml >= 6.0",
 ]
 

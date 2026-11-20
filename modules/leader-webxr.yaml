@@ -109,12 +109,34 @@ nodes:
   # since the squeeze, and holds it otherwise. Keeps the fingertips above the
   # table (the MuJoCo scene's, or TABLE_Z on a real robot), inside reach and
   # on their own side, and rides out input gaps up to 0.5 s without a re-grip.
+  # It also runs the left arm's intro, holds the right gripper 60% open and
+  # the left one closed.
   - id: clutch
     path: ../dora-openarm-clutch
     args: --scene demo --tick-hz 250
     env:
       ROBOT: "${ROBOT:-dummy}"
       TABLE_Z: "${TABLE_Z:-}"
+      # After each Start Arm this arm turns the finger on the right down and
+      # opens halfway, waits for X (or Enter in the UI), closes, turns the finger on
+      # the left down, and only then follows the grip (docs/teleop.md, Intro).
+      # right, left or none.
+      INTRO_ARM: "${INTRO_ARM:-left}"
+      # on: after each episode (success, fail or cancel) both arms go back to
+      # their start poses and that arm runs the intro again, so episodes can
+      # follow each other; off: only after Start Arm. The left controller's X
+      # stands in for Enter.
+      INTRO_EVERY_EPISODE: "${INTRO_EVERY_EPISODE:-on}"
+      # These grippers stay at a fixed opening whatever the trigger does, as
+      # SIDE=FRACTION of their range (0: closed), e.g. right=0.6, or none. They
+      # close after each Start Arm until the arm aligns, then open to it. The
+      # left one stays closed once its intro is done.
+      FIXED_GRIPPERS: "${FIXED_GRIPPERS:-right=0.6,left=0}"
+      # These arms keep the finger that is normally on their right lowest: the
+      # hand's roll about the fingers is replaced. After each Start Arm the arm
+      # turns into it slowly, once aligned. right, left, right,left or none
+      # (off for now: the right arm's pose then sits near J2's and J5's limits).
+      FINGER_DOWN: "${FINGER_DOWN:-none}"
     inputs:
       tick: _mod/tick
       pose_right: webxr/pose_right
@@ -125,6 +147,8 @@ nodes:
       state_right: _mod/state_right
       state_left: _mod/state_left
       control: _mod/command
+      # The intro's Enter (docs/teleop.md, Intro).
+      button_x: webxr/button_x
     outputs:
       - target_right
       - target_left

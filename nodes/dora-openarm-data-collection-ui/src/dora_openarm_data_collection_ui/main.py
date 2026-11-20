@@ -459,6 +459,11 @@ def _command_arm_stop():
     node.send_output("arm_command", pa.array(["stop"]))
 
 
+def _command_proceed():
+    """Move on an arm's intro that waits for Enter (the WebXR leader's clutch)."""
+    node.send_output("command", pa.array(["proceed"]))
+
+
 @app.get("/", response_class=HTMLResponse)
 def _root(request: Request):
     """Render the main HTML."""
@@ -648,6 +653,13 @@ def _arm_start(request: Request):
 def _arm_stop(request: Request):
     """Pause (stop) the arm(s)."""
     _command_arm_stop()
+    return RedirectResponse(request.url_for("_root"), 303)
+
+
+@app.post("/proceed")
+def _proceed(request: Request):
+    """Enter: move on an arm's intro that waits for it."""
+    _command_proceed()
     return RedirectResponse(request.url_for("_root"), 303)
 
 

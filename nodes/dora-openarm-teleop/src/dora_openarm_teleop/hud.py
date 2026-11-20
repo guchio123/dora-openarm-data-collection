@@ -9,7 +9,9 @@ taking it off. The vocabulary is openarm-quest-teleop's:
 * clutch: ``FOLLOW`` engaged, ``HOLD`` released, ``REGRIP`` locked (let go and
   squeeze again), ``LATE`` stale (input is late; keep holding still, the clutch
   resumes by itself), ``--`` nothing received yet. ``LATE`` and ``REGRIP`` ask for
-  different things, so they never share a prefix.
+  different things, so they never share a prefix. An arm running its intro shows
+  ``SETUP`` while it moves and ``PRESS X`` while it waits for the left
+  controller's X (or Enter in the UI).
 * gate: only arms that are not engaged, as ``GATE L:HOLDING(jump)``.
 """
 
@@ -25,7 +27,14 @@ NOTICE_S = 2.0
 MIN_INTERVAL_S = 0.2
 REPEAT_S = 2.0
 
-CLUTCH_WORDS = {"engaged": "FOLLOW", "released": "HOLD", "locked": "REGRIP", "stale": "LATE"}
+CLUTCH_WORDS = {
+    "engaged": "FOLLOW",
+    "released": "HOLD",
+    "locked": "REGRIP",
+    "stale": "LATE",
+    "setup": "SETUP",
+    "waiting": "PRESS X",
+}
 SIDE_LETTERS = (("left", "L"), ("right", "R"))
 
 

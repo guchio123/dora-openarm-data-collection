@@ -312,6 +312,9 @@
         <form id="arm-stop-form" action="{{ url_for("_arm_stop") }}" method="post">
           <input class="big-button finish arm-toggle" type="submit" value="Pause Arm">
         </form>
+        <form id="proceed-form" action="{{ url_for("_proceed") }}" method="post">
+          <input class="big-button start arm-toggle" type="submit" value="Continue [Enter]">
+        </form>
       {% endif -%}
     </div>
 
@@ -458,6 +461,15 @@
 
       document.addEventListener("keydown", function(event) {
         if (event.repeat) return;
+
+        if (event.key === "Enter") {
+          // Enter moves on an arm's intro (the WebXR leader's clutch), never
+          // the focused button: `n` submits that.
+          event.preventDefault();
+          const proceedForm = document.getElementById("proceed-form");
+          if (proceedForm) proceedForm.submit();
+          return;
+        }
 
         if (event.key.toLowerCase() === "c") {
           if (!skipTimer) {

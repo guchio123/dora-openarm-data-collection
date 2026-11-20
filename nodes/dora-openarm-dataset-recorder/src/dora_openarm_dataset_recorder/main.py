@@ -12,25 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Node to record data from OpenArm and cameras as OpenArm dataset."""
+"""Node to record data from OpenArm and cameras as a LeRobot dataset (v3.0).
+
+While an episode is recorded its data goes to a raw episode directory under
+``<dataset>/.staging/episodes/<n>``: arm states kept in memory and written as
+parquet when it ends, camera frames written as they arrive, one file each.
+When the episode ends with success or fail, a background thread appends it to
+the LeRobot dataset (see lerobot_v3) and deletes the raw directory; cancel
+deletes it at once. Episodes still in the staging area at startup (the node
+stopped before converting them) are converted first.
+"""
 
 import argparse
-from dataclasses import dataclass, field
 import datetime
-import copy
-import dora
 import json
+import math
 import os
 import pathlib
-import pyarrow as pa
-import pyarrow.parquet as pq
-import numpy as np
-import math
-from numpy.typing import ArrayLike
 import queue
 import shutil
 import threading
+import traceback
+from dataclasses import dataclass, field
+
+import dora
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import yaml
+from numpy.typing import ArrayLike
+
+from dora_openarm_dataset_recorder.lerobot_v3 import DatasetMismatch, LeRobotV3Dataset
+
+# The raw episode's own record of how it ended (task, success), written last:
+# a staging directory without it was never finished.
+EPISODE_INFO_FILE = "episode.json"
 
 
 @dataclass
@@ -71,6 +87,11 @@ class EpisodeWriter:
         self._episode = episode
         self._base_directory = self._directory / "episodes" / str(self._episode.number)
 
+    @property
+    def directory(self):
+        """The raw episode directory."""
+        return self._base_directory
+
     def write_camera_image(self, name, image, timestamp, format):
         """Write an image from a camera."""
         output_path = self._base_directory / "cameras" / name / f"{timestamp}.{format}"
@@ -84,7 +105,17 @@ class EpisodeWriter:
                 pa_output.write(image.buffers()[1])
 
     def finish(self):
-        """Write all pending data."""
+        """Write all pending data, then the episode's info file."""
+        self._write_states()
+        self._base_directory.mkdir(parents=True, exist_ok=True)
+        info = {
+            "number": self._episode.number,
+            "success": self._episode.success,
+            "task_index": self._episode.task_index,
+        }
+        (self._base_directory / EPISODE_INFO_FILE).write_text(json.dumps(info))
+
+    def _write_states(self):
         if self._episode.right_actions:
             self._write_kinematic_state(
                 self._base_directory / "action" / "arms" / "right",
@@ -172,98 +203,151 @@ class EpisodeWriter:
         pq.write_table(table, output_path)
 
 
-class DatasetWriter:
-    """Write a dataset."""
+class EpisodeConverter:
+    """Appends finished raw episodes to the LeRobot dataset on a background thread.
 
-    _VERSION = "0.4.0"
+    One at a time, so that the next episode can start meanwhile.
+    """
 
-    def __init__(self, directory, name, metadata):
-        """Initialize variables."""
-        self._directory = directory
-        self._name = name
-        self._metadata = metadata
-        self._base_directory = self._directory / name
-        self._episode_results = []
-        if self._base_directory.exists():
-            existing = self._read_existing_metadata()
-            if existing is not None:
-                mismatched = {
-                    k: v
-                    for k, v in self._metadata.items()
-                    if k in existing and existing[k] != v
-                }
-                if mismatched:
-                    raise ValueError(
-                        f"Existing dataset metadata does not match: {self._base_directory / 'metadata.yaml'}\n"
-                        + "\n".join(
-                            f"  {k}: existing={existing.get(k)!r}, current={v!r}"
-                            for k, v in mismatched.items()
-                        )
-                    )
-        else:
-            self._base_directory.mkdir(parents=True)
+    def __init__(self, dataset, staging):
+        """Start the thread."""
+        self._dataset = dataset
+        self._staging = staging
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run, name="lerobot-writer", daemon=True
+        )
+        self._thread.start()
 
-    def create_episode_writer(self, episode):
-        """Create a writer for the given episode."""
-        # The UI numbers episodes from 0 on every launch, so appending to an
-        # existing dataset collides. Take the next free number instead of
-        # crashing and losing every later episode.
-        episodes_directory = self._base_directory / "episodes"
-        used = {str(result["id"]) for result in self._episode_results}
-        if episodes_directory.exists():
-            used |= {p.name for p in episodes_directory.iterdir()}
-        if str(episode.number) in used:
-            numbers = [int(i) for i in used if i.isdigit()]
-            requested = episode.number
-            episode.number = max(numbers, default=-1) + 1
+    def submit(self, raw_directory):
+        """Convert this raw episode directory after the ones before it."""
+        self._queue.put(raw_directory)
+
+    def call(self, function):
+        """Run ``function(dataset)`` on the thread, between episodes."""
+        self._queue.put(function)
+
+    def close(self):
+        """Convert what is queued, then stop."""
+        pending = self._queue.qsize()
+        if pending:
             print(
-                f"Episode {requested} already exists in dataset; "
-                f"recording as episode {episode.number}",
+                f"Writing {pending} pending item(s) to the LeRobot dataset", flush=True
+            )
+        self._queue.put(None)
+        self._thread.join()
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            if callable(item):
+                item(self._dataset)
+                continue
+            self._convert(item)
+
+    def _convert(self, raw):
+        started = datetime.datetime.now()
+        try:
+            info = json.loads((raw / EPISODE_INFO_FILE).read_text())
+            index = self._dataset.add_episode(raw, info["task_index"], info["success"])
+        except Exception:  # noqa: BLE001 - any failure keeps the raw episode
+            failed = self._staging / "failed" / raw.name
+            failed.parent.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(failed, ignore_errors=True)
+            shutil.move(str(raw), str(failed))
+            print(
+                f"Could not add raw episode {raw.name} to the LeRobot dataset; kept it in "
+                f"{failed}:\n{traceback.format_exc()}",
                 flush=True,
             )
-        episode_id = str(episode.number)
-        episode_directory = episodes_directory / episode_id
-        if episode_directory.exists():
-            raise ValueError(f"Episode directory already exists: {episode_directory}")
-        return EpisodeWriter(self._base_directory, episode)
-
-    def finish_episode(self, episode):
-        """Add a finished episode to the writer."""
-        self._episode_results.append(
-            dict(
-                id=str(episode.number),
-                success=episode.success,
-                task_index=episode.task_index,
+            return
+        shutil.rmtree(raw, ignore_errors=True)
+        seconds = (datetime.datetime.now() - started).total_seconds()
+        if index is None:
+            print(
+                f"Raw episode {raw.name} has no frame with every stream; dropped",
+                flush=True,
             )
-        )
-        self._write_metadata_file()
+        else:
+            print(
+                f"Episode {index} written ({self._dataset.episodes[-1]['length']} frames, "
+                f"{seconds:.1f} s; {self._dataset.total_episodes} episodes in "
+                f"{self._dataset.root})",
+                flush=True,
+            )
+
+
+class DatasetWriter:
+    """Write a LeRobot dataset through a staging area."""
+
+    def __init__(self, directory, name, metadata, fps=30, converter_class=None):
+        """Open (or create) the dataset; refuse one whose metadata differs."""
+        self._base_directory = directory / name
+        self._staging = self._base_directory / ".staging"
+        self._metadata = metadata
+        tasks = [
+            str(task.get("prompt") if isinstance(task, dict) else task)
+            for task in metadata.get("tasks", []) or []
+        ]
+        try:
+            dataset = LeRobotV3Dataset(self._base_directory, fps, tasks, metadata)
+        except DatasetMismatch as error:
+            raise ValueError(str(error)) from error
+        self._converter = (converter_class or EpisodeConverter)(dataset, self._staging)
+        self._submit_pending()
+
+    def _submit_pending(self):
+        episodes = self._staging / "episodes"
+        if not episodes.exists():
+            return
+        for raw in sorted(episodes.iterdir(), key=lambda p: p.stat().st_mtime):
+            if (raw / EPISODE_INFO_FILE).exists():
+                print(
+                    f"Converting raw episode {raw.name} left from an earlier run",
+                    flush=True,
+                )
+                self._converter.submit(raw)
+            else:
+                print(
+                    f"Raw episode {raw} was never finished (the node stopped while recording); "
+                    "left as it is",
+                    flush=True,
+                )
+
+    def create_episode_writer(self, episode):
+        """Create a writer for the given episode, in a fresh staging directory."""
+        episodes_directory = self._staging / "episodes"
+        used = set()
+        for directory in (episodes_directory, self._staging / "failed"):
+            if directory.exists():
+                used |= {p.name for p in directory.iterdir()}
+        if str(episode.number) in used:
+            numbers = [int(i) for i in used if i.isdigit()]
+            episode.number = max(numbers, default=-1) + 1
+        return EpisodeWriter(self._staging, episode)
+
+    def finish_episode(self, episode_writer):
+        """Hand a finished episode to the converter."""
+        self._converter.submit(episode_writer.directory)
 
     def set_leader_ker_metadata(self, ker_metadata):
         """Record KER leader device metadata under equipment.leader.ker."""
-        equipment = self._metadata.setdefault("equipment", {})
-        leader = equipment.setdefault("leader", {})
-        ker = leader.setdefault("ker", {})
-        ker["id"] = "OpenArmKER"
-        ker["firmware_version"] = ker_metadata.get("fw")
-        ker["hardware_version"] = ker_metadata.get("hw")
-        self._write_metadata_file()
 
-    def _write_metadata_file(self):
-        metadata = copy.deepcopy(self._metadata)
-        metadata["version"] = self._VERSION
-        metadata["episodes"] = self._episode_results
-        output_path = self._base_directory / "metadata.yaml"
-        with open(output_path, "w", encoding="utf-8") as f:
-            yaml.dump(metadata, f, default_flow_style=False, allow_unicode=True)
+        def update(dataset):
+            equipment = dataset.metadata.setdefault("equipment", {})
+            leader = equipment.setdefault("leader", {})
+            ker = leader.setdefault("ker", {})
+            ker["id"] = "OpenArmKER"
+            ker["firmware_version"] = ker_metadata.get("fw")
+            ker["hardware_version"] = ker_metadata.get("hw")
 
-    def _read_existing_metadata(self):
-        metadata_path = self._base_directory / "metadata.yaml"
-        if not metadata_path.exists():
-            return None
-        with open(metadata_path, encoding="utf-8") as f:
-            existing_metadata = yaml.safe_load(f) or {}
-        self._episode_results = existing_metadata.get("episodes", [])
-        return existing_metadata
+        self._converter.call(update)
+
+    def close(self):
+        """Wait until every finished episode is in the dataset."""
+        self._converter.close()
 
 
 class FrequencyDetector:
@@ -450,9 +534,15 @@ def main():
     )
     parser.add_argument(
         "--name",
-        default=os.getenv("NAME", "dataset"),
-        help="The dataset name",
+        default=os.getenv("NAME", "lerobot"),
+        help="The dataset name: the LeRobot dataset's directory under --directory",
         type=str,
+    )
+    parser.add_argument(
+        "--fps",
+        default=int(os.getenv("FPS", "30")),
+        help="Frames per second of the LeRobot dataset",
+        type=int,
     )
     parser.add_argument(
         "--operation-type",
@@ -469,12 +559,13 @@ def main():
     else:
         metadata = _load_metadata(args.metadata_file, os.getenv("ROBOT"))
     _collect_dynamic_metadata(metadata, args, node)
-    dataset_writer = DatasetWriter(args.directory, args.name, metadata)
+    dataset_writer = DatasetWriter(args.directory, args.name, metadata, args.fps)
     event_reader = EventReader(node)
     try:
         _record_events(event_reader, dataset_writer)
     finally:
         event_reader.finish()
+        dataset_writer.close()
 
 
 def _record_events(event_reader, dataset_writer):
@@ -501,7 +592,7 @@ def _record_events(event_reader, dataset_writer):
                 if command == "success":
                     episode.success = True
                 episode_writer.finish()
-                dataset_writer.finish_episode(episode)
+                dataset_writer.finish_episode(episode_writer)
                 episode = None
                 episode_writer = None
             elif command == "cancel":
@@ -511,7 +602,7 @@ def _record_events(event_reader, dataset_writer):
             elif command == "quit":
                 if episode is not None:
                     episode_writer.finish()
-                    dataset_writer.finish_episode(episode)
+                    dataset_writer.finish_episode(episode_writer)
                     episode = None
                     episode_writer = None
                 break

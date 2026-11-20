@@ -57,7 +57,7 @@ def run_events(monkeypatch, tmp_path):
         )
         monkeypatch.setattr(recorder.dora, "Node", lambda: FakeNode(events))
         recorder.main()
-        return tmp_path / name / "episodes"
+        return tmp_path / name / ".staging" / "episodes"
 
     return run
 

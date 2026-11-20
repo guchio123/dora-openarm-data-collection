@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# WebXR teleoperation in one command, with Enter in this terminal for the UI's Enter.
+#
+#   scripts/teleop                       # ROBOT=pedestal-zed
+#   ROBOT=pedestal TABLE_Z=-0.3 scripts/teleop
+#
+# It sets up the Quest over USB (adb reverse, and a TURN relay unless one is
+# already listening), starts dataflow.yaml with LEADER=webxr under the ZED
+# SDK's group when this shell is not in it yet, and turns every Enter typed
+# here into the UI's Enter (POST /proceed), which moves the left arm's intro on.
+# Ctrl+C stops the dataflow.
+#
+# The arms move as soon as it starts: the UI starts them.
+set -eu
+cd "$(dirname "$0")/.."
+
+export LEADER="${LEADER:-webxr}"
+export ROBOT="${ROBOT:-pedestal-zed}"
+ui=http://localhost:8000
+
+if adb get-state >/dev/null 2>&1; then
+  adb reverse tcp:8443 tcp:8443 >/dev/null
+  adb reverse tcp:3479 tcp:3479 >/dev/null
+  echo "Quest: on USB. Open https://localhost:8443/ in its browser and press Start, facing the way the robot faces."
+else
+  echo "Quest: adb sees no device. Connect it over USB (allow USB debugging) and run this again."
+fi
+
+turn=
+if ! ss -ltn | grep -q '127\.0\.0\.1:3479 '; then
+  turnserver -c scripts/webxr-usb/turnserver.conf \
+    --pidfile "${XDG_RUNTIME_DIR:-/tmp}/webxr-turn.pid" >/dev/null 2>&1 &
+  turn=$!
+fi
+
+run='. .venv/bin/activate && exec scripts/dora-envsubst run dataflow.yaml --uv'
+# Its own process group, so that Ctrl+C reaches dora through sg as well.
+if id -nG | grep -qw zed || [ ! -d /usr/local/zed ]; then
+  setsid sh -c "$run" &
+else
+  setsid sg zed -c "$run" &
+fi
+dora=$!
+
+stop() {
+  kill -INT -- "-$dora" 2>/dev/null || true
+}
+trap stop INT TERM
+
+echo "The arms start moving now. Enter here = Enter in the UI ($ui). Ctrl+C stops."
+while kill -0 "$dora" 2>/dev/null; do
+  if read -r -t 1 _; then
+    if curl -s -o /dev/null -X POST "$ui/proceed"; then
+      echo "[Enter sent]"
+    else
+      echo "[the UI is not up yet]"
+    fi
+  fi
+done
+wait "$dora" || true
+[ -n "$turn" ] && kill "$turn" 2>/dev/null || true

@@ -23,9 +23,11 @@ sessions.
 |---|---|
 | **Grip** (middle finger), held | That arm follows the hand's *motion* since the squeeze |
 | Grip released | That arm holds where it is |
-| **Trigger** (index finger) | That gripper: pulled closes |
+| **Trigger** (index finger) | Nothing by default: the right gripper stays 60% open and the left one closed (`FIXED_GRIPPERS`). For a gripper not in `FIXED_GRIPPERS`: pulled closes |
+| Turning the hand about the fingers | Ignored for an arm in `FINGER_DOWN` (none by default), whose finger normally on the right stays down |
 | **A** | Idle: start an episode. Recording: save it as a success |
 | **B** | Recording: save it as a failure. Idle: **hold 2 s** to quit |
+| **X** (left controller), or **Enter** in the UI (http://localhost:8000/) | The left arm's intro, while it waits: close and flip (see [Intro](#intro)) |
 
 The arm follows the hand's displacement, not its absolute position. So you can
 let go, move your hand somewhere comfortable, and squeeze again: the arm doesn't
@@ -74,6 +76,85 @@ with the patches listed in its [`PATCHES.md`](../nodes/dora-openarm-webxr/PATCHE
     exactly the gate's `jump_tol`, so the gate would never engage.
   - Later states are ignored, because holding the measured pose would make the
     hold sag with the arm.
+- **Fixed grippers.** `FIXED_GRIPPERS` (`right=0.6,left=0` in
+  `leader-webxr.yaml`; `none` turns it off) holds a gripper at a fixed
+  fraction of its range open, whatever the trigger does: the right one at 60%,
+  -0.471 rad (27°), the left one closed. The left arm's intro still opens and
+  closes its gripper; the fixed opening applies once the intro is done.
+  - After each Start Arm it is first commanded closed, until it has been for
+    0.3 s and the arm measures it closed. dora-openarm runs with
+    `--align-trigger gripper` and executes nothing (`STARTED`, not `ALIGNED`)
+    until the commanded gripper is closed, so a gripper held open from the
+    start would keep that arm from ever moving.
+  - In MuJoCo the right gripper closed 0.4 s after the start and opened right
+    after.
+- **Finger down.** `FINGER_DOWN` (`none` in `leader-webxr.yaml` for now;
+  `FINGER_DOWN=right` turns it on for the right arm) keeps an arm's finger
+  that is normally on its right lowest
+  (`intro.finger_down`). The target follows the hand's position and the
+  direction its fingers point, but its roll about that direction is set: the
+  finger on the right straight down when the fingers point level, as far down
+  as a tilt allows otherwise. Within 20° of pointing straight up or down the
+  roll fades back to the hand's, since neither finger is lower there.
+  - It is a constraint on the IK's target: whatever the IK solves for has it.
+  - After each Start Arm the arm first waits for the same alignment as a fixed
+    gripper, then turns into it at 0.5 rad/s (90° in 3.1 s), shown as `SETUP`.
+    It does not follow the hand until the turn is done and the grip has been
+    released, as after any start.
+  - The pose sits near the joint limits: in MuJoCo the right J5 ended at
+    82.9° (gate range ±87°) and J2 at -6.3° (gate range from -7.1°). Some
+    hand directions may not be reachable there; the gate then holds
+    (`ik_limit`) rather than following.
+
+#### Intro
+
+`INTRO_ARM` (`left` in `leader-webxr.yaml`; `none` turns it off) names an arm
+that, after each Start Arm and after each episode, runs a fixed sequence before
+the clutch takes it:
+
+0. After an episode only: the end effector goes back from wherever the hand
+   left it to the start pose (the FK of where the arm measured after its last
+   Start Arm), in a straight line and a slerp, eased, at 0.1 m/s and 0.5 rad/s
+   on average, whichever takes longer. The gripper stays as it was.
+
+1. The gripper closes. dora-openarm runs with `--align-trigger gripper`: it
+   executes nothing (the UI shows `STARTED`, not `ALIGNED`) until the commanded
+   gripper is closed. So nothing turns until the measured gripper has closed,
+   which shows that the commands are reaching the arm.
+2. The end effector rolls about its approach axis, levelled to horizontal,
+   until the finger that is normally on the right points down and the gap
+   between the fingers is level. Then the gripper opens halfway.
+3. It waits for **X** on the left controller (a press, the edge from released
+   to pressed) or **Enter** in the UI, which sends the command `proceed`.
+4. The gripper closes, until it measures closed or for at most 2 s, since it
+   may be closing on something.
+5. The end effector rolls back through the start orientation and on until the
+   finger that is normally on the left points down.
+
+Then the clutch holds that pose: release the grip if it is squeezed, and
+squeeze to follow, as after any Start Arm. The hand is ignored until then.
+
+- "Normally" is the start pose: the fingers point forward and the
+  ee_control_point site's +y is the robot's left for both arms, so the finger on
+  the right is on the site's -y side.
+- The roll is a Cartesian target that goes through the IK and the gate like a
+  followed one. It turns at 0.5 rad/s on average (`--intro-turn-speed`),
+  easing in and out, so 90° takes 3.1 s and the flip 6.3 s.
+- A roll of 90° is J5's whole range (±1.5708) and the gate keeps 0.05 rad
+  inside it, so the IK brings in the shoulder too. In the IK model the turn
+  is exact for the first roll and within 1° and 2 mm for the flip, at the edge
+  of J2's range. In MuJoCo the gate held nothing during the whole sequence.
+- `--intro-open` sets how far the gripper opens (fraction of its range, 0.5).
+- The HUD shows `SETUP` while it moves and `PRESS X` while it waits. A Pause
+  Arm and Start Arm runs it again from the start pose.
+- An episode ends with the UI command `success`, `fail` or `cancel`, which the
+  clutch also receives. The sequence then starts again with step 0, so that
+  episodes can follow each other without a Pause Arm and Start Arm. The other
+  arm goes back to its start pose the same way (step 0 alone, gripper as it
+  is), and then holds there, locked until the grip is released.
+  `INTRO_EVERY_EPISODE=off` keeps all of it to Start Arm. An end that arrives
+  while an arm is still on its way changes nothing for that arm.
+- In the MuJoCo robot, X also re-places the scene's objects (dora-openarm-mujoco).
 
 ### IK (`dora-openarm-teleop-ik`)
 
@@ -100,6 +181,24 @@ with the patches listed in its [`PATCHES.md`](../nodes/dora-openarm-webxr/PATCHE
 
 The generated MJCF and config are cached under `~/.cache/dora-openarm-teleop/`
 and keyed by their settings.
+
+**Known limitation: at a joint limit the IK keeps the position and gives up
+the orientation.**
+
+- J2 stops the upper arm 10° past hanging straight, so a hand moved inward
+  soon asks for more than the arm can do at that orientation.
+- Upstream caps the orientation error each solve uses (0.25 rad), but caps the
+  position error only while the target moves faster than 0.6-0.9 m/s. So a
+  level hand moved slowly sideways past the limit tilts the gripper. From 36
+  recorded poses of each arm, ±0.15 m in 0.8 s tilted it up to 42° (right) and
+  44° (left).
+- Capping the position error at every speed, with `--ori-cost 3` and caps of
+  0.05 m / 0.5 rad, held the tilt to 1.9° / 3.4° in simulation. On the robot
+  it was worse to drive. The left arm's wrist sits at J5's limit after its
+  intro, so most hand turns can't be reached there. That IK then moved the
+  whole arm to turn the gripper: up to 3.6 cm forward or back for a 29° roll
+  of the hand, against 0.2 cm here. The operator saw it as the arm
+  exaggerating forward and back motion, so it was taken out.
 
 ### Gate (`dora-openarm-gate`)
 
@@ -140,11 +239,153 @@ Shows in the headset:
 
 - `READY` / `REC mm:ss ep N`;
 - each arm's clutch: `FOLLOW` (engaged), `HOLD`, `REGRIP` (locked: release
-  and squeeze again), `LATE` (input gap);
+  and squeeze again), `LATE` (input gap), `SETUP` and `ENTER` (its
+  [intro](#intro) or finger-down turn moves, or it waits for Enter in the UI);
 - any arm the gate is holding, and why.
 
 It also buzzes: right controller on start/success/fail, left on cancel, both on
 quit.
+
+## Start pose
+
+Start Arm moves each pedestal arm to its driver config's start pose, and the
+clutch holds the arm there until its grip is squeezed. `openarm_pedestal`'s
+start pose has the elbow at 90° and every other joint at 0, so the wrist is
+21.6 cm in front of `arm_origin`.
+
+Ours holds each wrist 10 cm closer to the body, at the same height and with
+the gripper turned the same way:
+
+| | J1 | J4 | J6 | Other joints |
+|---|---|---|---|---|
+| Right | -0.465 | 1.928 | -0.109 | 0 |
+| Left | 0.465 | 1.928 | 0.109 | 0 |
+
+- The shoulder (J1) swings the upper arm back 26.6°, the elbow (J4) bends to
+  110.5°, and J6 keeps the gripper level.
+- The values come from the teleop IK, given the old start pose moved 10 cm
+  back. Checked by forward kinematics: 10.0 cm back, 0.1 mm off in height,
+  0.08° off in orientation.
+- Both configs carry it:
+  [`configs/openarm_pedestal_teleop.yaml`](../configs/openarm_pedestal_teleop.yaml)
+  (right) and
+  [`configs/openarm_pedestal_soft_gripper.yaml`](../configs/openarm_pedestal_soft_gripper.yaml)
+  (left).
+- The stop pose stays `openarm_pedestal`'s.
+- The IK still starts from the model's `home` keyframe, the old start pose.
+  Given the new pose as its target, it gets there in about 1 s, to within
+  0.1°. The gate holds until then.
+- The left intro rolls the gripper as before: ±90° about its fingers, within
+  1 mm and 1°.
+
+## Impedance
+
+The pedestal robots (`ROBOT=pedestal`, `pedestal-zed`, `pedestal-viz`) run
+their arms through `dora-openarm-impedance`, so that an arm can touch a wall
+without pressing hard on it.
+
+dora-openarm drives each arm joint with the motor's MIT command,
+`kp·(q* − q) + kd·(0 − q̇) + tau`, with the driver config's kp and kd and
+`tau = 0`. The springs alone then hold the arm up, and it sags by
+gravity / kp: at the start pose J1 holds 4.3 Nm with kp 70, 61 mrad, which
+is the sag the gate measured (Gate). So kp has to be stiff to stay near the
+target, and a stiff spring pushes hard on whatever the arm touches.
+
+`dora-openarm-impedance` runs dora-openarm unchanged, with one difference in
+its driver (`openarm_driver.SingleArmDriver`):
+
+- **Gravity feedforward.** Every MIT command carries the arm's gravity torque
+  at the latest measured joints as `tau`. It is computed from the MJCF with
+  MuJoCo's inverse dynamics at zero velocity
+  ([`gravity.py`](../nodes/dora-openarm-teleop/src/dora_openarm_teleop/gravity.py)),
+  9 µs per call. It is clipped per joint to 15 15 8 8 2 2 2 Nm.
+- **Softer kp** for joints 1-4: 20 20 12 12 instead of 70 70 70 60. The
+  wrist keeps the config's 10 10 10. kd, the gripper and everything else stay
+  the config's: the safety checks, the start and stop moves (which get the
+  feedforward too) and the measured state.
+  - The wrist joints sit at most 0.12 m from the fingertip, so they barely
+    change what a fingertip presses with. Softened to 4 they took at most
+    0.4 N off a 2 cm push (6.3 N to 5.9 N), and let the gripper swing up to
+    16° off its command in a fast move (J6, episode 9).
+- **Velocity feedforward.** dora-openarm sends `dq = 0`, so the damping term
+  brakes every motion and the arm trails a moving target by kd / kp: 39 ms
+  for J1 at the config's gains, 138 ms at the soft ones. The node sends the
+  commands' own joint velocity as dq instead: their change over the last
+  20 ms, as they arrive, clipped to the config's joint velocity limits and
+  zero after a 100 ms pause. Contact compliance is kp's, so it stays.
+  - Recorded on the robot, the arm trailed its commands by 145-150 ms (J1)
+    at the config's gains and 165-175 ms at the soft ones without it.
+  - In a one-joint model of J1 (0.25 kg m², a 0.3 rad minimum-jerk move in
+    0.6 s) the lag at mid-move is 51 ms at kp 70 with dq = 0, 157 ms at kp 20,
+    and 49 ms at kp 20 with the feedforward. The model's 157 ms matches the
+    robot; its 51 ms does not, so ~100 ms of the robot's lag at kp 70 comes
+    from somewhere else than the motors' gains.
+- **Latency log.** Every `LATENCY_LOG_S` (10 s) each arm node logs how late
+  commands reach it from the gate (`metadata["timestamp"]`, which dora-echo
+  passes on) and how long dora-openarm spends on each event. On the robot:
+  0.2 ms and 0.2 ms (median; 0.3 ms and 0.3 ms p95). Nothing in the software
+  waits.
+- **Friction compensation.** That ~100 ms is friction. A joint slides only once
+  its spring pulls harder than its friction, so it trails by friction / kp.
+  While the joints slid with dq = 0 and gravity fed forward, the torque the
+  PD put out along the motion was 0.74 0.49 0.54 0.98 0.10 0.19 0.16 Nm
+  (J1-J7), the same at any speed: friction. At the soft kp that is 1.4-4.7°.
+  The node adds 0.7x of it to tau along the commands' motion
+  (`IMPEDANCE_FRICTION`), faded in by tanh(velocity / 0.05 rad/s), and only
+  while the joint trails its command that way: in full from friction / kp
+  behind, none once it has caught up. Pushing whenever the commands move
+  carries the joint past the target once they stop.
+  - In the one-joint J1 model with 0.74 Nm of friction (stiction included),
+    a 29° move in 1 s: 4.3° worst error and 66 ms lag with the velocity
+    feedforward alone, 3.0° and 41 ms with the compensation. Pushing whenever
+    the commands move gets 2.8° and 40 ms, but stops 1.6° past the target
+    rather than 0.26°.
+  - At rest friction still holds a joint anywhere within friction / kp of its
+    command; no feedforward changes that, only kp does.
+  - On the robot's left-arm flip (the intro, 180° in 6 s): J5 trailed by
+    240 ms and up to 8.6° with dq = 0, 60 ms and 4.8° with the velocity
+    feedforward.
+
+The model's gravity matches the robot. Over a 3 s recording of both real arms
+moving, the measured joint torque follows the model's gravity torque with the
+same sign on every joint (J1 0.87-0.92 × the model, r = 0.84). The wrist
+joints, whose gravity barely changes, measure what the model says, e.g. left
+J6 0.52 Nm against 0.46 Nm.
+
+How hard a fingertip pressed 2 cm into a surface pushes back, from the model's
+Jacobian (rigid links, no friction; the fingertip taken 0.12 m out from the IK's
+control point along the fingers):
+
+| Pose (right arm) | Direction | Config kp | Impedance kp, wrist 4 (before) | Impedance kp |
+|---|---|---|---|---|
+| Start pose (elbow 90°) | Forward, along the fingers | 28.2 N | 8.1 N | 8.1 N |
+| | Sideways | 5.3 N | 1.3 N | 1.5 N |
+| | Down | 4.1 N | 1.1 N | 1.2 N |
+| Reaching forward (J1 1.0, J4 0.5 rad) | Forward | 61.6 N | 17.5 N | 17.8 N |
+| | Along the fingers | 148.9 N | 42.5 N | 42.5 N |
+
+Joint impedance softens the arm in most directions, but not along the line
+from the shoulder to the fingertip with the arm stretched out. A push that
+way loads the links, not the motors, so poking a wall head-on with a straight
+arm stays stiff. It also does nothing about the impact itself, which depends
+on how fast the arm arrives.
+
+| Variable | Default | |
+|---|---|---|
+| `IMPEDANCE` | `on` | `off` runs plain dora-openarm, with the config's gains and no feedforward |
+| `IMPEDANCE_KP` | `20,20,12,12,10,10,10` | kp for joints 1-7. Lower is softer, and follows less closely |
+| `GRAVITY_SCALE` | `1.0` | Fraction of the model's gravity sent. Lower it if the arm drifts up |
+| `IMPEDANCE_VELOCITY_FF` | `1.0` | Fraction of the commands' velocity sent as dq; `0` is dora-openarm's dq = 0 |
+| `IMPEDANCE_FRICTION` | `0.52,0.34,0.38,0.69,0.07,0.13,0.11` | Nm per joint added along the motion while a joint trails; `0,0,0,0,0,0,0` for none |
+| `LATENCY_LOG_S` | `10` | Seconds between latency log lines; `0` for none |
+
+The left arm also uses
+[`configs/openarm_pedestal_soft_gripper.yaml`](../configs/openarm_pedestal_soft_gripper.yaml):
+`openarm_pedestal` with about an eighth of its grip force
+(`gripper_posforce_limits` 0.12 instead of 1.0). The driver's conversion of that
+value to a torque is marked unverified upstream, so it is tuned on the robot:
+the closed fingers pressed on each other with 0.94 Nm at 0.5 and 0.52 Nm at
+0.25, both still too strong.
 
 ## Timing
 

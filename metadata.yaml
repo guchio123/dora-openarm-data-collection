@@ -73,9 +73,8 @@ robots:
     equipment:
       perceptions:
         cameras:
-          # Disabled with the nodes in modules/robot-pedestal-zed.yaml.
-          # wrist_left: {}
-          # wrist_right: {}
+          wrist_left: {}
+          wrist_right: {}
           head_left: {}
           head_right: {}
           # ZED Mini depth aligned with head_left, 16-bit PNG in mm (0: no depth).

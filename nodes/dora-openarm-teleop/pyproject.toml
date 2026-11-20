@@ -25,6 +25,8 @@ dora-openarm-clutch = "dora_openarm_teleop.clutch_node:main"
 dora-openarm-gate = "dora_openarm_teleop.gate_node:main"
 dora-openarm-teleop-ik = "dora_openarm_teleop.ik_node:main"
 dora-openarm-teleop-hud = "dora_openarm_teleop.hud_node:main"
+# Needs dora-openarm and openarm-driver, which the data collection environment has.
+dora-openarm-impedance = "dora_openarm_teleop.impedance_arm:main"
 openarm-teleop-check = "dora_openarm_teleop.check:main"
 openarm-teleop-tls = "dora_openarm_teleop.tls:main"
 
